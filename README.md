@@ -10,11 +10,17 @@ It automates the boring parts:
 
 ## Status
 
-Early skeleton. See `PRD.md` for the roadmap and CLI contract.
+Shippable MVP. See `PRD.md` for the CLI contract + roadmap.
 
-## Quickstart
+## Install
 
-```bash
+```sh
+cargo install --git https://github.com/iamkaf/welder
+```
+
+## Usage
+
+```sh
 # in an asset pack folder
 welder init --yes
 welder doctor
@@ -26,20 +32,12 @@ welder publish --dry-run
 
 ## Config
 
-Welder uses `welder.toml` (TOML-only for v0.1). A starter file is included in this repo.
+Welder uses `welder.toml` (TOML-only for v0.1).
 
-## Development
+## Notes
 
-This repository is intended to be built with Rust (edition 2021).
+- `welder publish` shells out to **butler**. If butler isn’t installed, `--dry-run` still works and non-dry-run will error with install instructions.
 
-Useful local checks:
-
-- `cargo fmt`
-- `cargo check`
-
-If you don’t have a Rust toolchain installed:
-
-- https://rustup.rs
 
 ## License
 
