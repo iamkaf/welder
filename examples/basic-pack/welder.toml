@@ -1,0 +1,60 @@
+version = 1
+
+[pack]
+name = "Basic Pack Example"
+slug = "basic-pack-example"
+author = "iamkaf"
+brand = "iamkaf"
+license = "CC0-1.0"
+semver = "0.1.0"
+
+[paths]
+input = "src"
+dist = "dist"
+previews = "dist/previews"
+exports = "dist/exports"
+sheets  = "dist/sheets"
+package = "dist/package"
+
+[inputs]
+include = ["**/*.png"]
+exclude = []
+
+[build]
+resolutions = [1, 2, 4]
+filter = "nearest"
+trim_transparent = true
+
+[preview]
+styles = ["sheet", "grid"]
+background = "#141414"
+scale = 2
+
+[preview.watermark]
+enabled = true
+text = "iamkaf"
+opacity = 0.12
+position = "bottom-right"
+margin_px = 12
+
+[sheet]
+max_width = 1024
+max_height = 1024
+padding_px = 4
+sort = "name"
+
+[grid]
+cell_px = 64
+padding_px = 8
+columns = 8
+
+[metadata]
+readme_template = "templates/README.md.tmpl"
+itch_template = "templates/ITCH.md.tmpl"
+
+[publish.itch]
+enabled = false
+user = "iamkaf"
+project = "basic-pack-example"
+channel = "default"
+butler_bin = "butler"
