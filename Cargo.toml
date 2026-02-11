@@ -15,6 +15,7 @@ toml = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
 walkdir = "2"
 globset = "0.4"
+zip = { version = "0.6", default-features = false }
 
 [profile.release]
 lto = true

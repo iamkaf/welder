@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -6,8 +7,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use image::imageops::FilterType;
+use image::{DynamicImage, GenericImage, Rgba, RgbaImage};
 use serde::Deserialize;
 use walkdir::WalkDir;
+use zip::write::FileOptions;
+use zip::{CompressionMethod, DateTime, ZipWriter};
 
 #[derive(Parser, Debug)]
 #[command(name = "welder")]
@@ -226,15 +230,25 @@ fn run() -> Result<()> {
             clean,
             dry_run,
         } => run_build(&config_path, res, clean, dry_run),
-        Commands::Preview { .. } => {
-            bail!("preview not implemented yet")
+        Commands::Preview {
+            profile: _,
+            style,
+            dry_run,
+        } => run_preview(&config_path, &style, dry_run),
+        Commands::Package {
+            profile: _,
+            out,
+            include_previews,
+        } => {
+            let out = out.map(PathBuf::from);
+            run_package(&config_path, out, include_previews).map(|_| ())
         }
-        Commands::Package { .. } => {
-            bail!("package not implemented yet")
-        }
-        Commands::Publish { .. } => {
-            bail!("publish not implemented yet")
-        }
+        Commands::Publish {
+            profile: _,
+            channel,
+            dry_run,
+            yes: _,
+        } => run_publish(&config_path, channel, dry_run),
     }
 }
 
@@ -282,7 +296,17 @@ fn run_init(
 
 fn run_doctor(config_path: &Path, only_butler: bool) -> Result<()> {
     if only_butler {
-        check_butler("butler")?;
+        let butler_bin = if config_path.exists() {
+            load_config(config_path)
+                .ok()
+                .and_then(|cfg| cfg.publish)
+                .and_then(|p| p.itch)
+                .and_then(|itch| itch.butler_bin)
+                .unwrap_or_else(|| "butler".to_string())
+        } else {
+            "butler".to_string()
+        };
+        ensure_butler_available(&butler_bin)?;
         println!("doctor: OK (butler)");
         return Ok(());
     }
@@ -317,8 +341,8 @@ fn run_doctor(config_path: &Path, only_butler: bool) -> Result<()> {
         if let Some(itch) = &publish.itch {
             if itch.enabled {
                 let bin = itch.butler_bin.as_deref().unwrap_or("butler");
-                if let Err(err) = check_butler(bin) {
-                    issues.push(format!("butler check failed for '{}': {err:#}", bin));
+                if let Err(err) = ensure_butler_available(bin) {
+                    issues.push(format!("butler check failed for '{bin}': {err:#}"));
                 }
             }
         }
@@ -362,10 +386,13 @@ fn run_build(config_path: &Path, res: Option<String>, clean: bool, dry_run: bool
         return Ok(());
     }
 
-    for file in input_files {
-        let in_path = cfg.paths.input.join(&file);
+    for file in &input_files {
+        let in_path = cfg.paths.input.join(file);
+        let img = image::open(&in_path)
+            .with_context(|| format!("failed reading image {}", in_path.display()))?;
+
         for factor in &resolutions {
-            let out_path = cfg.paths.exports.join(format!("{factor}x")).join(&file);
+            let out_path = cfg.paths.exports.join(format!("{factor}x")).join(file);
 
             if dry_run {
                 println!("[dry-run] {} -> {}", in_path.display(), out_path.display());
@@ -377,11 +404,8 @@ fn run_build(config_path: &Path, res: Option<String>, clean: bool, dry_run: bool
                     .with_context(|| format!("failed creating {}", parent.display()))?;
             }
 
-            let img = image::open(&in_path)
-                .with_context(|| format!("failed reading image {}", in_path.display()))?;
-
             let scaled = if *factor == 1 {
-                img
+                img.clone()
             } else {
                 img.resize_exact(
                     img.width() * *factor,
@@ -396,10 +420,187 @@ fn run_build(config_path: &Path, res: Option<String>, clean: bool, dry_run: bool
         }
     }
 
-    println!(
-        "build: exported {} source file(s)",
-        collect_input_pngs(&cfg)?.len()
+    println!("build: exported {} source file(s)", input_files.len());
+    Ok(())
+}
+
+fn run_preview(config_path: &Path, style: &str, dry_run: bool) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    let styles = preview_styles(style, &cfg.preview.styles)?;
+    let sprites = load_sprites(&cfg)?;
+    if sprites.is_empty() {
+        bail!("no matching PNG files found for preview");
+    }
+
+    if dry_run {
+        println!("[dry-run] create {}", cfg.paths.previews.display());
+    } else {
+        fs::create_dir_all(&cfg.paths.previews)
+            .with_context(|| format!("failed creating {}", cfg.paths.previews.display()))?;
+    }
+
+    if styles.iter().any(|s| s == "sheet") {
+        let out = cfg.paths.previews.join("sheet.png");
+        if dry_run {
+            println!("[dry-run] write {}", out.display());
+        } else {
+            let mut sheet = render_sheet(&cfg, &sprites)?;
+            apply_watermark(&cfg, &mut sheet);
+            sheet
+                .save(&out)
+                .with_context(|| format!("failed writing {}", out.display()))?;
+        }
+    }
+
+    if styles.iter().any(|s| s == "grid") {
+        let out = cfg.paths.previews.join("grid.png");
+        if dry_run {
+            println!("[dry-run] write {}", out.display());
+        } else {
+            let mut grid = render_grid(&cfg, &sprites)?;
+            apply_watermark(&cfg, &mut grid);
+            grid.save(&out)
+                .with_context(|| format!("failed writing {}", out.display()))?;
+        }
+    }
+
+    println!("preview: generated {}", styles.join(", "));
+    Ok(())
+}
+
+fn run_package(
+    config_path: &Path,
+    out_path: Option<PathBuf>,
+    include_previews: bool,
+) -> Result<PathBuf> {
+    let cfg = load_config(config_path)?;
+    run_package_with_config(&cfg, out_path, include_previews)
+}
+
+fn run_package_with_config(
+    cfg: &Config,
+    out_path: Option<PathBuf>,
+    include_previews: bool,
+) -> Result<PathBuf> {
+    if !cfg.paths.exports.exists() {
+        bail!(
+            "exports directory is missing at {} (run 'welder build' first)",
+            cfg.paths.exports.display()
+        );
+    }
+
+    fs::create_dir_all(&cfg.paths.package)
+        .with_context(|| format!("failed creating {}", cfg.paths.package.display()))?;
+
+    let out = out_path.unwrap_or_else(|| {
+        cfg.paths
+            .package
+            .join(format!("{}-{}.zip", cfg.pack.slug, cfg.pack.semver))
+    });
+
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
+
+    let file =
+        fs::File::create(&out).with_context(|| format!("failed creating {}", out.display()))?;
+    let mut zip = ZipWriter::new(file);
+    let ts = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .map_err(|_| anyhow::anyhow!("failed creating fixed ZIP timestamp"))?;
+
+    let file_opts = FileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .last_modified_time(ts)
+        .unix_permissions(0o644);
+
+    let mut export_files = collect_files_sorted(&cfg.paths.exports)?;
+    for file in export_files.drain(..) {
+        let rel = file
+            .strip_prefix(&cfg.paths.exports)
+            .with_context(|| format!("failed to relativize {}", file.display()))?;
+        let zip_path = format!("exports/{}", normalize_for_glob(rel));
+        let bytes =
+            fs::read(&file).with_context(|| format!("failed reading {}", file.display()))?;
+        zip.start_file(zip_path, file_opts)
+            .context("failed starting zip file entry")?;
+        zip.write_all(&bytes)
+            .context("failed writing zip file entry")?;
+    }
+
+    if include_previews && cfg.paths.previews.exists() {
+        let mut preview_files = collect_files_sorted(&cfg.paths.previews)?;
+        for file in preview_files.drain(..) {
+            let rel = file
+                .strip_prefix(&cfg.paths.previews)
+                .with_context(|| format!("failed to relativize {}", file.display()))?;
+            let zip_path = format!("previews/{}", normalize_for_glob(rel));
+            let bytes =
+                fs::read(&file).with_context(|| format!("failed reading {}", file.display()))?;
+            zip.start_file(zip_path, file_opts)
+                .context("failed starting zip file entry")?;
+            zip.write_all(&bytes)
+                .context("failed writing zip file entry")?;
+        }
+    }
+
+    if let Some(readme) = generate_readme_if_configured(cfg)? {
+        zip.start_file("README.md", file_opts)
+            .context("failed starting README entry")?;
+        zip.write_all(readme.as_bytes())
+            .context("failed writing README entry")?;
+    }
+
+    zip.finish().context("failed finalizing zip")?;
+
+    println!("package: wrote {}", out.display());
+    Ok(out)
+}
+
+fn run_publish(config_path: &Path, channel_override: Option<String>, dry_run: bool) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    let itch = cfg
+        .publish
+        .as_ref()
+        .and_then(|p| p.itch.as_ref())
+        .context("publish.itch config is missing")?;
+
+    if !itch.enabled {
+        bail!("publish.itch.enabled is false");
+    }
+
+    let package_path = run_package_with_config(&cfg, None, false)?;
+    let butler_bin = itch.butler_bin.as_deref().unwrap_or("butler");
+    let channel = channel_override.unwrap_or_else(|| itch.channel.clone());
+    let target = format!("{}/{}:{channel}", itch.user, itch.project);
+
+    let cmd_preview = format!(
+        "{} push {} {}",
+        shell_escape(butler_bin),
+        shell_escape(&package_path.to_string_lossy()),
+        shell_escape(&target)
     );
+
+    if dry_run {
+        println!("publish dry-run command:");
+        println!("{cmd_preview}");
+        return Ok(());
+    }
+
+    ensure_butler_available(butler_bin)?;
+
+    let status = Command::new(butler_bin)
+        .arg("push")
+        .arg(&package_path)
+        .arg(&target)
+        .status()
+        .with_context(|| format!("failed to execute '{} push ...'", butler_bin))?;
+
+    if !status.success() {
+        bail!("publish failed: butler exited with status {status}");
+    }
+
+    println!("publish: pushed {}", package_path.display());
     Ok(())
 }
 
@@ -439,19 +640,37 @@ fn validate_config(cfg: &Config, issues: &mut Vec<String>) {
     if cfg.inputs.include.is_empty() {
         issues.push("inputs.include must not be empty".to_string());
     }
+    if cfg.sheet.max_width == 0 || cfg.sheet.max_height == 0 {
+        issues.push("sheet.max_width and sheet.max_height must be > 0".to_string());
+    }
+    if cfg.grid.cell_px == 0 {
+        issues.push("grid.cell_px must be > 0".to_string());
+    }
+    if let Some(filter) = &cfg.build.filter {
+        if !filter.eq_ignore_ascii_case("nearest") {
+            issues.push("build.filter must be 'nearest' for MVP".to_string());
+        }
+    }
 }
 
-fn check_butler(bin: &str) -> Result<()> {
-    let status = Command::new(bin)
-        .arg("--version")
-        .status()
-        .with_context(|| format!("failed to execute '{}'", bin))?;
-
-    if !status.success() {
-        bail!("'{} --version' exited with status {}", bin, status);
+fn ensure_butler_available(bin: &str) -> Result<()> {
+    let result = Command::new(bin).arg("--version").status();
+    match result {
+        Ok(status) => {
+            if status.success() {
+                Ok(())
+            } else {
+                bail!("'{} --version' exited with status {}", bin, status)
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            bail!(
+                "butler not found at '{}'. Install from https://itch.io/docs/butler/ and set publish.itch.butler_bin",
+                bin
+            )
+        }
+        Err(err) => Err(err).with_context(|| format!("failed to execute '{}'", bin)),
     }
-
-    Ok(())
 }
 
 fn starter_config(name: &str, slug: &str, author: &str, brand: &str, input: &str) -> String {
@@ -495,13 +714,17 @@ fn parse_resolutions(override_value: Option<&str>, default_values: &[u32]) -> Re
     if values.is_empty() {
         bail!("no resolutions configured");
     }
-    if values.iter().any(|v| *v == 0) {
+    if values.contains(&0) {
         bail!("resolution factors must be > 0");
     }
     Ok(values)
 }
 
 fn collect_input_pngs(cfg: &Config) -> Result<Vec<PathBuf>> {
+    if !cfg.paths.input.exists() {
+        return Ok(Vec::new());
+    }
+
     let include = build_globset(&cfg.inputs.include)?;
     let exclude = build_globset(&cfg.inputs.exclude)?;
     let mut files = Vec::new();
@@ -539,6 +762,18 @@ fn collect_input_pngs(cfg: &Config) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn collect_files_sorted(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
+        }
+    }
+    files.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    Ok(files)
+}
+
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
@@ -549,4 +784,436 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
 
 fn normalize_for_glob(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn preview_styles(style_arg: &str, config_default: &[String]) -> Result<Vec<String>> {
+    let requested = if style_arg.eq_ignore_ascii_case("both") {
+        vec!["sheet".to_string(), "grid".to_string()]
+    } else {
+        style_arg
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    let mut styles = if requested.is_empty() {
+        config_default
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    } else {
+        requested
+    };
+
+    styles.sort();
+    styles.dedup();
+
+    for style in &styles {
+        if style != "sheet" && style != "grid" {
+            bail!("unsupported preview style '{style}'");
+        }
+    }
+    Ok(styles)
+}
+
+fn load_sprites(cfg: &Config) -> Result<Vec<(PathBuf, DynamicImage)>> {
+    let files = collect_input_pngs(cfg)?;
+    let mut sprites = Vec::with_capacity(files.len());
+    for file in files {
+        let abs = cfg.paths.input.join(&file);
+        let img = image::open(&abs).with_context(|| format!("failed reading {}", abs.display()))?;
+        sprites.push((file, img));
+    }
+    Ok(sprites)
+}
+
+fn render_sheet(cfg: &Config, sprites: &[(PathBuf, DynamicImage)]) -> Result<RgbaImage> {
+    let mut placements = Vec::with_capacity(sprites.len());
+    let mut x = cfg.sheet.padding_px;
+    let mut y = cfg.sheet.padding_px;
+    let mut row_h = 0u32;
+    let mut max_x = 0u32;
+
+    for (_, img) in sprites {
+        let w = img.width();
+        let h = img.height();
+
+        if x > cfg.sheet.padding_px && x + w + cfg.sheet.padding_px > cfg.sheet.max_width {
+            x = cfg.sheet.padding_px;
+            y = y.saturating_add(row_h).saturating_add(cfg.sheet.padding_px);
+            row_h = 0;
+        }
+
+        if y + h + cfg.sheet.padding_px > cfg.sheet.max_height {
+            bail!(
+                "sheet overflow: sprites exceed sheet.max_height ({})",
+                cfg.sheet.max_height
+            );
+        }
+
+        placements.push((x, y));
+        max_x = max_x.max(x + w + cfg.sheet.padding_px);
+        row_h = row_h.max(h);
+        x = x.saturating_add(w).saturating_add(cfg.sheet.padding_px);
+    }
+
+    let height = if sprites.is_empty() {
+        cfg.sheet.padding_px.saturating_mul(2).max(1)
+    } else {
+        y.saturating_add(row_h)
+            .saturating_add(cfg.sheet.padding_px)
+            .max(1)
+    };
+    let width = max_x.max(cfg.sheet.padding_px.saturating_mul(2)).max(1);
+    let bg = parse_hex_color(&cfg.preview.background)?;
+    let mut canvas = RgbaImage::from_pixel(width, height, bg);
+
+    for ((_, img), (px, py)) in sprites.iter().zip(placements) {
+        canvas
+            .copy_from(&img.to_rgba8(), px, py)
+            .context("failed placing sprite in sheet")?;
+    }
+
+    Ok(canvas)
+}
+
+fn render_grid(cfg: &Config, sprites: &[(PathBuf, DynamicImage)]) -> Result<RgbaImage> {
+    let cell = cfg.grid.cell_px.max(1);
+    let pad = cfg.grid.padding_px;
+    let cols = cfg.grid.columns.max(1);
+    let rows = ((sprites.len() as u32) + cols - 1) / cols;
+    let width = cols
+        .saturating_mul(cell)
+        .saturating_add((cols + 1).saturating_mul(pad))
+        .max(1);
+    let height = rows
+        .saturating_mul(cell)
+        .saturating_add((rows + 1).saturating_mul(pad))
+        .max(1);
+    let bg = parse_hex_color(&cfg.preview.background)?;
+    let mut canvas = RgbaImage::from_pixel(width, height, bg);
+
+    for (idx, (_, img)) in sprites.iter().enumerate() {
+        let i = idx as u32;
+        let col = i % cols;
+        let row = i / cols;
+        let x0 = pad + col.saturating_mul(cell + pad);
+        let y0 = pad + row.saturating_mul(cell + pad);
+        let thumb = fit_in_cell(img, cell);
+        let ox = x0 + (cell - thumb.width()) / 2;
+        let oy = y0 + (cell - thumb.height()) / 2;
+        canvas
+            .copy_from(&thumb, ox, oy)
+            .context("failed placing sprite in grid")?;
+    }
+
+    Ok(canvas)
+}
+
+fn fit_in_cell(img: &DynamicImage, cell_px: u32) -> RgbaImage {
+    let w = img.width().max(1);
+    let h = img.height().max(1);
+    let scale = (cell_px as f32 / w as f32).min(cell_px as f32 / h as f32);
+    let new_w = ((w as f32 * scale).floor() as u32).clamp(1, cell_px);
+    let new_h = ((h as f32 * scale).floor() as u32).clamp(1, cell_px);
+    img.resize_exact(new_w, new_h, FilterType::Nearest)
+        .to_rgba8()
+}
+
+fn parse_hex_color(s: &str) -> Result<Rgba<u8>> {
+    let value = s.trim().trim_start_matches('#');
+    if value.len() != 6 {
+        bail!("preview.background must be #RRGGBB, got '{s}'");
+    }
+    let r = u8::from_str_radix(&value[0..2], 16).with_context(|| format!("bad red in '{s}'"))?;
+    let g = u8::from_str_radix(&value[2..4], 16).with_context(|| format!("bad green in '{s}'"))?;
+    let b = u8::from_str_radix(&value[4..6], 16).with_context(|| format!("bad blue in '{s}'"))?;
+    Ok(Rgba([r, g, b, 255]))
+}
+
+fn apply_watermark(cfg: &Config, image: &mut RgbaImage) {
+    let wm = match cfg.preview.watermark.as_ref() {
+        Some(wm) if wm.enabled => wm,
+        _ => return,
+    };
+
+    let text = wm
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("iamkaf");
+    let opacity = wm.opacity.unwrap_or(0.12).clamp(0.0, 1.0);
+    let margin = wm.margin_px.unwrap_or(12);
+    let position = wm.position.as_deref().unwrap_or("bottom-right");
+    draw_bitmap_text(image, text, opacity, position, margin);
+}
+
+fn draw_bitmap_text(image: &mut RgbaImage, text: &str, opacity: f32, position: &str, margin: u32) {
+    let scale = 2u32;
+    let glyph_w = 5u32;
+    let glyph_h = 7u32;
+    let spacing = 1u32;
+    let chars: Vec<char> = text.to_ascii_uppercase().chars().collect();
+    if chars.is_empty() {
+        return;
+    }
+
+    let text_w = (chars.len() as u32)
+        .saturating_mul(glyph_w + spacing)
+        .saturating_sub(spacing)
+        .saturating_mul(scale);
+    let text_h = glyph_h.saturating_mul(scale);
+
+    let (mut x, y) = match position.to_ascii_lowercase().as_str() {
+        "top-left" | "tl" => (margin, margin),
+        "top-right" | "tr" => (image.width().saturating_sub(text_w + margin), margin),
+        "bottom-left" | "bl" => (margin, image.height().saturating_sub(text_h + margin)),
+        "center" => (
+            (image.width().saturating_sub(text_w)) / 2,
+            (image.height().saturating_sub(text_h)) / 2,
+        ),
+        _ => (
+            image.width().saturating_sub(text_w + margin),
+            image.height().saturating_sub(text_h + margin),
+        ),
+    };
+
+    let alpha = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+    for ch in chars {
+        draw_glyph(image, ch, x, y, scale, alpha);
+        x = x.saturating_add((glyph_w + spacing).saturating_mul(scale));
+    }
+}
+
+fn draw_glyph(image: &mut RgbaImage, ch: char, x: u32, y: u32, scale: u32, alpha: u8) {
+    let pattern = glyph_pattern(ch);
+    for (row, bits) in pattern.iter().enumerate() {
+        for (col, bit) in bits.chars().enumerate() {
+            if bit != '1' {
+                continue;
+            }
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let px = x + col as u32 * scale + dx;
+                    let py = y + row as u32 * scale + dy;
+                    if px >= image.width() || py >= image.height() {
+                        continue;
+                    }
+                    blend_pixel(image, px, py, Rgba([255, 255, 255, alpha]));
+                }
+            }
+        }
+    }
+}
+
+fn blend_pixel(image: &mut RgbaImage, x: u32, y: u32, src: Rgba<u8>) {
+    let dst = image.get_pixel_mut(x, y);
+    let sa = src[3] as f32 / 255.0;
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        return;
+    }
+    let blend = |sc: u8, dc: u8| -> u8 {
+        (((sc as f32 * sa) + (dc as f32 * da * (1.0 - sa))) / out_a)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    *dst = Rgba([
+        blend(src[0], dst[0]),
+        blend(src[1], dst[1]),
+        blend(src[2], dst[2]),
+        (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]);
+}
+
+fn glyph_pattern(ch: char) -> [&'static str; 7] {
+    match ch {
+        'A' => [
+            "01110", "10001", "10001", "11111", "10001", "10001", "10001",
+        ],
+        'B' => [
+            "11110", "10001", "10001", "11110", "10001", "10001", "11110",
+        ],
+        'C' => [
+            "01111", "10000", "10000", "10000", "10000", "10000", "01111",
+        ],
+        'D' => [
+            "11110", "10001", "10001", "10001", "10001", "10001", "11110",
+        ],
+        'E' => [
+            "11111", "10000", "10000", "11110", "10000", "10000", "11111",
+        ],
+        'F' => [
+            "11111", "10000", "10000", "11110", "10000", "10000", "10000",
+        ],
+        'G' => [
+            "01111", "10000", "10000", "10011", "10001", "10001", "01111",
+        ],
+        'H' => [
+            "10001", "10001", "10001", "11111", "10001", "10001", "10001",
+        ],
+        'I' => [
+            "11111", "00100", "00100", "00100", "00100", "00100", "11111",
+        ],
+        'J' => [
+            "11111", "00010", "00010", "00010", "00010", "10010", "01100",
+        ],
+        'K' => [
+            "10001", "10010", "10100", "11000", "10100", "10010", "10001",
+        ],
+        'L' => [
+            "10000", "10000", "10000", "10000", "10000", "10000", "11111",
+        ],
+        'M' => [
+            "10001", "11011", "10101", "10101", "10001", "10001", "10001",
+        ],
+        'N' => [
+            "10001", "10001", "11001", "10101", "10011", "10001", "10001",
+        ],
+        'O' => [
+            "01110", "10001", "10001", "10001", "10001", "10001", "01110",
+        ],
+        'P' => [
+            "11110", "10001", "10001", "11110", "10000", "10000", "10000",
+        ],
+        'Q' => [
+            "01110", "10001", "10001", "10001", "10101", "10010", "01101",
+        ],
+        'R' => [
+            "11110", "10001", "10001", "11110", "10100", "10010", "10001",
+        ],
+        'S' => [
+            "01111", "10000", "10000", "01110", "00001", "00001", "11110",
+        ],
+        'T' => [
+            "11111", "00100", "00100", "00100", "00100", "00100", "00100",
+        ],
+        'U' => [
+            "10001", "10001", "10001", "10001", "10001", "10001", "01110",
+        ],
+        'V' => [
+            "10001", "10001", "10001", "10001", "10001", "01010", "00100",
+        ],
+        'W' => [
+            "10001", "10001", "10001", "10101", "10101", "10101", "01010",
+        ],
+        'X' => [
+            "10001", "10001", "01010", "00100", "01010", "10001", "10001",
+        ],
+        'Y' => [
+            "10001", "10001", "01010", "00100", "00100", "00100", "00100",
+        ],
+        'Z' => [
+            "11111", "00001", "00010", "00100", "01000", "10000", "11111",
+        ],
+        '0' => [
+            "01110", "10001", "10011", "10101", "11001", "10001", "01110",
+        ],
+        '1' => [
+            "00100", "01100", "00100", "00100", "00100", "00100", "01110",
+        ],
+        '2' => [
+            "01110", "10001", "00001", "00010", "00100", "01000", "11111",
+        ],
+        '3' => [
+            "11110", "00001", "00001", "01110", "00001", "00001", "11110",
+        ],
+        '4' => [
+            "00010", "00110", "01010", "10010", "11111", "00010", "00010",
+        ],
+        '5' => [
+            "11111", "10000", "10000", "11110", "00001", "00001", "11110",
+        ],
+        '6' => [
+            "01110", "10000", "10000", "11110", "10001", "10001", "01110",
+        ],
+        '7' => [
+            "11111", "00001", "00010", "00100", "01000", "01000", "01000",
+        ],
+        '8' => [
+            "01110", "10001", "10001", "01110", "10001", "10001", "01110",
+        ],
+        '9' => [
+            "01110", "10001", "10001", "01111", "00001", "00001", "01110",
+        ],
+        '-' => [
+            "00000", "00000", "00000", "11111", "00000", "00000", "00000",
+        ],
+        '_' => [
+            "00000", "00000", "00000", "00000", "00000", "00000", "11111",
+        ],
+        '.' => [
+            "00000", "00000", "00000", "00000", "00000", "00110", "00110",
+        ],
+        ' ' => [
+            "00000", "00000", "00000", "00000", "00000", "00000", "00000",
+        ],
+        _ => [
+            "11111", "10001", "00110", "00100", "00110", "10001", "11111",
+        ],
+    }
+}
+
+fn generate_readme_if_configured(cfg: &Config) -> Result<Option<String>> {
+    let Some(metadata) = cfg.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let _ = &metadata.itch_template;
+    let Some(path) = metadata.readme_template.as_ref() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let tmpl = fs::read_to_string(path)
+        .with_context(|| format!("failed reading readme template {}", path.display()))?;
+    Ok(Some(render_template(&tmpl, cfg)))
+}
+
+fn render_template(template: &str, cfg: &Config) -> String {
+    let mut out = template.to_string();
+    let license = cfg.pack.license.as_deref().unwrap_or("UNLICENSED");
+    let resolutions = cfg
+        .build
+        .resolutions
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let replacements = [
+        ("{{ pack.name }}", cfg.pack.name.as_str()),
+        ("{{ pack.slug }}", cfg.pack.slug.as_str()),
+        ("{{ pack.author }}", cfg.pack.author.as_str()),
+        ("{{ pack.brand }}", cfg.pack.brand.as_str()),
+        ("{{ pack.semver }}", cfg.pack.semver.as_str()),
+        ("{{ pack.license }}", license),
+        (
+            "{{ paths.exports }}",
+            &normalize_for_glob(&cfg.paths.exports),
+        ),
+        (
+            "{{ paths.previews }}",
+            &normalize_for_glob(&cfg.paths.previews),
+        ),
+    ];
+
+    for (from, to) in replacements {
+        out = out.replace(from, to);
+    }
+    out.replace("{{ build.resolutions | join(\", \") }}", &resolutions)
+}
+
+fn shell_escape(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "-._/:".contains(ch))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
