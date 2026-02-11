@@ -32,6 +32,11 @@ Welder uses `welder.toml` (TOML-only for v0.1). A starter file is included in th
 
 This repository is intended to be built with Rust (edition 2021).
 
+Useful local checks:
+
+- `cargo fmt`
+- `cargo check`
+
 If you don’t have a Rust toolchain installed:
 
 - https://rustup.rs
