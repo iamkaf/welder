@@ -4,7 +4,10 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use image::imageops::FilterType;
 use serde::Deserialize;
+use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(name = "welder")]
@@ -217,9 +220,12 @@ fn run() -> Result<()> {
             yes,
         } => run_init(&config_path, name, author, brand, input, yes),
         Commands::Doctor { butler } => run_doctor(&config_path, butler),
-        Commands::Build { .. } => {
-            bail!("build not implemented yet")
-        }
+        Commands::Build {
+            profile: _,
+            res,
+            clean,
+            dry_run,
+        } => run_build(&config_path, res, clean, dry_run),
         Commands::Preview { .. } => {
             bail!("preview not implemented yet")
         }
@@ -330,6 +336,73 @@ fn run_doctor(config_path: &Path, only_butler: bool) -> Result<()> {
     bail!("doctor failed")
 }
 
+fn run_build(config_path: &Path, res: Option<String>, clean: bool, dry_run: bool) -> Result<()> {
+    let cfg = load_config(config_path)?;
+    let resolutions = parse_resolutions(res.as_deref(), &cfg.build.resolutions)?;
+
+    if clean && cfg.paths.dist.exists() {
+        if dry_run {
+            println!("[dry-run] remove {}", cfg.paths.dist.display());
+        } else {
+            fs::remove_dir_all(&cfg.paths.dist)
+                .with_context(|| format!("failed removing {}", cfg.paths.dist.display()))?;
+        }
+    }
+
+    if dry_run {
+        println!("[dry-run] create {}", cfg.paths.exports.display());
+    } else {
+        fs::create_dir_all(&cfg.paths.exports)
+            .with_context(|| format!("failed creating {}", cfg.paths.exports.display()))?;
+    }
+
+    let input_files = collect_input_pngs(&cfg)?;
+    if input_files.is_empty() {
+        println!("no matching PNG files found");
+        return Ok(());
+    }
+
+    for file in input_files {
+        let in_path = cfg.paths.input.join(&file);
+        for factor in &resolutions {
+            let out_path = cfg.paths.exports.join(format!("{factor}x")).join(&file);
+
+            if dry_run {
+                println!("[dry-run] {} -> {}", in_path.display(), out_path.display());
+                continue;
+            }
+
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed creating {}", parent.display()))?;
+            }
+
+            let img = image::open(&in_path)
+                .with_context(|| format!("failed reading image {}", in_path.display()))?;
+
+            let scaled = if *factor == 1 {
+                img
+            } else {
+                img.resize_exact(
+                    img.width() * *factor,
+                    img.height() * *factor,
+                    FilterType::Nearest,
+                )
+            };
+
+            scaled
+                .save(&out_path)
+                .with_context(|| format!("failed writing image {}", out_path.display()))?;
+        }
+    }
+
+    println!(
+        "build: exported {} source file(s)",
+        collect_input_pngs(&cfg)?.len()
+    );
+    Ok(())
+}
+
 fn load_config(path: &Path) -> Result<Config> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed reading config {}", path.display()))?;
@@ -362,6 +435,9 @@ fn validate_config(cfg: &Config, issues: &mut Vec<String>) {
     }
     if cfg.grid.columns == 0 {
         issues.push("grid.columns must be > 0".to_string());
+    }
+    if cfg.inputs.include.is_empty() {
+        issues.push("inputs.include must not be empty".to_string());
     }
 }
 
@@ -397,4 +473,80 @@ fn slugify(s: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+fn parse_resolutions(override_value: Option<&str>, default_values: &[u32]) -> Result<Vec<u32>> {
+    let mut values = if let Some(raw) = override_value {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|token| {
+                token
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid resolution value '{token}'"))
+            })
+            .collect::<Result<Vec<u32>>>()?
+    } else {
+        default_values.to_vec()
+    };
+
+    values.sort_unstable();
+    values.dedup();
+    if values.is_empty() {
+        bail!("no resolutions configured");
+    }
+    if values.iter().any(|v| *v == 0) {
+        bail!("resolution factors must be > 0");
+    }
+    Ok(values)
+}
+
+fn collect_input_pngs(cfg: &Config) -> Result<Vec<PathBuf>> {
+    let include = build_globset(&cfg.inputs.include)?;
+    let exclude = build_globset(&cfg.inputs.exclude)?;
+    let mut files = Vec::new();
+
+    for entry in WalkDir::new(&cfg.paths.input).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let abs = entry.path();
+        let ext = abs
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("png"))
+            .unwrap_or(false);
+        if !ext {
+            continue;
+        }
+
+        let rel = abs
+            .strip_prefix(&cfg.paths.input)
+            .with_context(|| format!("failed to strip prefix for {}", abs.display()))?;
+        let rel_s = normalize_for_glob(rel);
+
+        if !include.is_match(&rel_s) {
+            continue;
+        }
+        if exclude.is_match(&rel_s) {
+            continue;
+        }
+        files.push(PathBuf::from(rel_s));
+    }
+
+    files.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    Ok(files)
+}
+
+fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern).with_context(|| format!("invalid glob '{pattern}'"))?);
+    }
+    builder.build().context("failed to build glob matcher")
+}
+
+fn normalize_for_glob(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
