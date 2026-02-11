@@ -1,0 +1,32 @@
+# {{ pack.name }}
+
+By **{{ pack.brand }}**  
+Version: `{{ pack.semver }}`  
+License: {{ pack.license }}
+
+## What’s inside
+
+- Exports: `{{ paths.exports }}/` (1x / 2x / 4x)
+- Previews: `{{ paths.previews }}/` (sheet + grid)
+
+## How to use
+
+1. Pick a resolution folder:
+   - `1x/` for native pixel size
+   - `2x/4x/` for scaled versions (nearest-neighbor)
+2. Import sprites into your engine/editor.
+
+## Build notes (Welder)
+
+This pack is generated with **Welder**.
+
+Suggested commands:
+
+- `welder doctor`
+- `welder build`
+- `welder preview`
+- `welder package`
+
+## Credits
+
+- Art + pack: {{ pack.author }}

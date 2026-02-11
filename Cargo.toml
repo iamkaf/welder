@@ -1,0 +1,22 @@
+[package]
+name = "welder"
+version = "0.1.0"
+edition = "2021"
+description = "High-speed CLI to turn raw pixel art into ship-ready asset packs."
+license = "MIT"
+repository = "https://github.com/iamkaf/welder"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+walkdir = "2"
+globset = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

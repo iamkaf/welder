@@ -1,0 +1,5 @@
+# Welder outputs
+/dist/
+
+# OS/editor
+.DS_Store

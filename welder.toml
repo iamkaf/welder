@@ -1,0 +1,60 @@
+version = 1
+
+[pack]
+name = "New Asset Pack"
+slug = "new-asset-pack"
+author = "iamkaf"
+brand = "iamkaf"
+license = "CC0-1.0"
+semver = "0.1.0"
+
+[paths]
+input = "src"
+dist = "dist"
+previews = "dist/previews"
+exports = "dist/exports"
+sheets  = "dist/sheets"
+package = "dist/package"
+
+[inputs]
+include = ["**/*.png"]
+exclude = ["**/_wip/**", "**/.trash/**"]
+
+[build]
+resolutions = [1, 2, 4]
+filter = "nearest"
+trim_transparent = true
+
+[preview]
+styles = ["sheet", "grid"]
+background = "#141414"
+scale = 2
+
+[preview.watermark]
+enabled = true
+text = "iamkaf"
+opacity = 0.12
+position = "bottom-right"
+margin_px = 12
+
+[sheet]
+max_width = 2048
+max_height = 2048
+padding_px = 2
+sort = "name"
+
+[grid]
+cell_px = 64
+padding_px = 8
+columns = 8
+
+[metadata]
+readme_template = "templates/README.md.tmpl"
+itch_template = "templates/ITCH.md.tmpl"
+
+[publish.itch]
+enabled = true
+user = "iamkaf"
+project = "new-asset-pack"
+channel = "default"
+butler_bin = "butler"
